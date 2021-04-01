@@ -15,11 +15,11 @@ import (
 	//metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	appsinformers "k8s.io/client-go/informers/apps/v1"
+	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
-	appslisters "k8s.io/client-go/listers/apps/v1"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
@@ -100,7 +100,7 @@ func NewController(
 		bundleSynced:      bundleInformer.Informer().HasSynced,
 		workqueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Bundles"),
 		recorder:          recorder,
-		interpreter:  	   NewInterpreter(BundleMachine.WithContext(NewContext(map[string]interface{}{CtxBundleClient: rukpakclientset}))),
+		interpreter:  	   NewInterpreter(BundleMachine.WithContext(BundleMachineContext{client: rukpakclientset})),
 	}
 
 	klog.Info("Setting up event handlers")
@@ -275,6 +275,26 @@ func (c *Controller) enqueueBundle(obj interface{}) {
 }
 
 
+type ControllerContext struct {
+	kubeclientset kubernetes.Interface
+	rukpakclientset clientset.Interface
+	configMapInformer coreinformers.ConfigMapInformer
+	bundleInformer informers.BundleInformer
+	configmapLister corelisters.ConfigMapLister
+	bundleLister    listers.BundleLister
+	workqueue        workqueue.RateLimitingInterface
+}
+
+func NewControllerMachine(kubeclientset kubernetes.Interface,
+	rukpakclientset clientset.Interface,
+	configmapInformer coreinformers.ConfigMapInformer,
+	bundleInformer informers.BundleInformer) *Machine {
+	return Machine{
+		Name: "ControllerMachine",
+		InitialState: &WaitingForCachesToSync,
+		States: []State{&IdleController, &WaitingForCachesToSync, &ProcessBundle, &ProcessObject},
+	}.WithContext()
+}
 
 func NewControllerMachine(
 	kubeclientset kubernetes.Interface,
@@ -293,7 +313,7 @@ func NewControllerMachine(
 		bundleLister:      bundleInformer.Lister(),
 		bundleSynced:      bundleInformer.Informer().HasSynced,
 		workqueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Bundles"),
-		interpreter:  	   NewInterpreter(BundleMachine.WithContext(NewContext(map[string]interface{}{CtxBundleClient: rukpakclientset}))),
+		interpreter:  	   NewInterpreter(BundleMachine.WithContext(BundleMachineContext{client: rukpakclientset})),
 	}
 
 	klog.Info("Setting up event handlers")
@@ -313,54 +333,25 @@ type EventType string
 
 type Event interface {
 	Type() EventType
-	Ctx() Context
+	Ctx() interface{}
 }
 
 type TypedEvent struct {
 	EventType EventType
-	Context Context
+	Context interface{}
 }
 
 func (e TypedEvent) Type() EventType {
 	return e.EventType
 }
 
-func (e TypedEvent) Ctx() Context {
+func (e TypedEvent) Ctx() interface{} {
 	return e.Context
 }
 
-type Context struct {
-	values map[string]interface{}
-}
+type Action func(interface{}, Event)
 
-func NewContext(values map[string]interface{}) Context {
-	return Context{
-		values: values,
-	}
-}
-
-func (c Context) Get(key string) interface{} {
-	val, ok := c.values[key]
-	if !ok {
-		return nil
-	}
-	return val
-}
-
-func (c Context) Has(keys ...string) bool {
-	for _, k := range keys {
-		_, ok := c.values[k]
-		if !ok {
-			return false
-		}
-	}
-	return true
-}
-
-
-type Action func(Context, Event)
-
-type GuardFunc func(Context, Event) bool
+type GuardFunc func(interface{}, Event) bool
 
 type Transition struct {
 	Target  State
@@ -377,7 +368,7 @@ type StateNode struct {
 
 type Machine struct {
 	Name             string
-	Ctx              Context
+	Ctx              interface{}
 	Parents          []*Machine
 	ParallelChildren bool
 	Children         []*Machine
@@ -390,12 +381,12 @@ func (m *Machine) Send(event Event) {
 	m.Receive(m.Ctx, event)
 }
 
-func (m *Machine) WithContext(ctx Context) Machine {
+func (m Machine) WithContext(ctx interface{}) Machine {
 	m.Ctx = ctx
 	return *m
 }
 
-func (m *Machine) Receive(ctx Context, event Event) State {
+func (m *Machine) Receive(ctx interface{}, event Event) State {
 	m.Ctx = ctx
 	if m.CurrentState == nil {
 		m.CurrentState = m.InitialState
@@ -419,7 +410,7 @@ func (m *Machine) GetTransitions(e EventType) []Transition {
 	return nil
 }
 
-func (m *Machine) Enter(ctx Context, event Event)  {
+func (m *Machine) Enter(ctx interface{}, event Event)  {
 	fmt.Println("entering", m.ID())
 	m.Ctx = ctx
 	if m.CurrentState == nil {
@@ -428,22 +419,22 @@ func (m *Machine) Enter(ctx Context, event Event)  {
 	return
 }
 
-func (m *Machine) Exit(ctx Context, event Event)  {
+func (m *Machine) Exit(ctx interface{}, event Event)  {
 	return
 }
 
 type State interface {
 	ID() string
 	GetTransitions(EventType) []Transition
-	Enter(Context, Event)
-	Exit(Context, Event)
-	Receive(Context, Event) State
+	Enter(interface{}, Event)
+	Exit(interface{}, Event)
+	Receive(interface{}, Event) State
 }
 
 var _ State = &Machine{}
 var _ State = &StateNode{}
 
-func (s *StateNode) Receive(ctx Context, event Event) State {
+func (s *StateNode) Receive(ctx interface{}, event Event) State {
 	s.Enter(ctx, event)
 	defer s.Exit(ctx, event)
 
@@ -483,14 +474,14 @@ func (s *StateNode) GetTransitions(e EventType) []Transition {
 	return ts
 }
 
-func (s *StateNode) Enter(ctx Context, event Event)  {
+func (s *StateNode) Enter(ctx interface{}, event Event)  {
 	if s.OnEnter == nil {
 		return
 	}
 	s.OnEnter(ctx, event)
 }
 
-func (s *StateNode) Exit(ctx Context, event Event)  {
+func (s *StateNode) Exit(ctx interface{}, event Event)  {
 	if s.OnExit == nil {
 		return
 	}
@@ -548,15 +539,16 @@ func (m *Interpreter) Receive(e Event) {
 }
 
 
-var CtxBundle = "Bundle"
-var CtxConfigMaps = "ConfigMaps"
-
 var BundleSync EventType = "BundleSync"
+
+type BundleEventContext struct {
+	Bundle *rukpakv1alpha1.Bundle
+}
 
 func BundleSyncEvent(bundle *rukpakv1alpha1.Bundle) Event {
 	return &TypedEvent{
 		EventType: BundleSync,
-		Context: NewContext(map[string]interface{}{CtxBundle: bundle}),
+		Context: BundleEventContext{Bundle: bundle},
 	}
 }
 
@@ -564,16 +556,20 @@ func GetBundleFromEvent(e Event) (*rukpakv1alpha1.Bundle, error) {
 	if e.Type() != "BundleSync" {
 		return nil, fmt.Errorf("can't get bundle from event of this type")
 	}
-	b, ok := e.Ctx().Get(CtxBundle).(*rukpakv1alpha1.Bundle)
+	c, ok := e.Ctx().(BundleEventContext)
 	if !ok {
 		return nil, fmt.Errorf("wrong type found in event context")
 	}
-	return b, nil
+	return c.Bundle, nil
 }
 
 var ConfigMapSync EventType = "ConfigMapSync"
 
 var CtxBundleClient = "BundleClient"
+
+type BundleMachineContext struct {
+	client clientset.Interface
+}
 
 var BundleMachine = Machine{
 	Name: "BundleMachine",
@@ -586,7 +582,7 @@ var Idle = StateNode{
 	Transitions: map[EventType][]Transition{
 		BundleSync: {
 			{
-				Gaurd: func(ctx Context, event Event) bool {
+				Gaurd: func(ctx interface{}, event Event) bool {
 					bundle, err := GetBundleFromEvent(event)
 					if err != nil {
 						return false
@@ -596,7 +592,7 @@ var Idle = StateNode{
 				Target: &BundlesPresent,
 			},
 			{
-				Gaurd: func(ctx Context, event Event) bool {
+				Gaurd: func(ctx interface{}, event Event) bool {
 					bundle, err := GetBundleFromEvent(event)
 					if err != nil {
 						return false
@@ -621,7 +617,7 @@ var BundleStateUnknown = StateNode{
 	Transitions: map[EventType][]Transition{
 		BundleSync: {
 			{
-				Gaurd: func(ctx Context, event Event) bool {
+				Gaurd: func(ctx interface{}, event Event) bool {
 					bundle, err := GetBundleFromEvent(event)
 					if err != nil {
 						return false
@@ -631,7 +627,7 @@ var BundleStateUnknown = StateNode{
 				Target: &BundleGenerationMatches,
 			},
 			{
-				Gaurd: func(ctx Context, event Event) bool {
+				Gaurd: func(ctx interface{}, event Event) bool {
 					bundle, err := GetBundleFromEvent(event)
 					if err != nil {
 						return false
@@ -656,7 +652,7 @@ var ContentStateUnknown = StateNode{
 	Transitions: map[EventType][]Transition{
 		BundleSync: {
 			{
-				Gaurd: func(ctx Context, event Event) bool {
+				Gaurd: func(ctx interface{}, event Event) bool {
 					bundle, err := GetBundleFromEvent(event)
 					if err != nil {
 						return false
@@ -668,7 +664,7 @@ var ContentStateUnknown = StateNode{
 				Target: &ContentSynced,
 			},
 			{
-				Gaurd: func(ctx Context, event Event) bool {
+				Gaurd: func(ctx interface{}, event Event) bool {
 					// if unpacked content does not exist
 					return true
 				},
@@ -688,7 +684,7 @@ var ContentSynced = StateNode{
 
 var ContentNotSynced = StateNode{
 	Name: "ContentNotSynced",
-	OnEnter: func(ctx Context, event Event) {
+	OnEnter: func(ctx interface{}, event Event) {
 		// do the unpack
 	},
 }
@@ -697,16 +693,17 @@ var BundleRequiresCleanup = StateNode{
 	Name: "BundleRequiresCleanup",
 }
 
-func SyncObservedGenerationAction(ctx Context, event Event) {
+func SyncObservedGenerationAction(ctx interface{}, event Event) {
 	bundle, err := GetBundleFromEvent(event)
 	if err != nil {
 		return
 	}
-	client, err := GetRukPakClientFromMachineContext(ctx)
-	if err != nil {
+
+	machineContext, ok := ctx.(BundleMachineContext)
+	if !ok {
 		return
 	}
-	if err := SyncObservedGeneration(client, bundle); err != nil {
+	if err := SyncObservedGeneration(machineContext.client, bundle); err != nil {
 		// log
 	}
 	return
@@ -722,13 +719,6 @@ func SyncObservedGeneration(client clientset.Interface, bundle *rukpakv1alpha1.B
 	return nil
 }
 
-func GetRukPakClientFromMachineContext(ctx Context) (clientset.Interface, error) {
-	c, ok :=  ctx.Get(CtxBundleClient).(clientset.Interface)
-	if !ok {
-		return nil, fmt.Errorf("no client found in machine context")
-	}
-	return c, nil
-}
 
 // TODO: parallel states
 // TODO: context key validation

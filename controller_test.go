@@ -13,7 +13,7 @@ import (
 func TestMachine(t *testing.T) {
 	initial := &v1alpha1.Bundle{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "test", Generation: 4}}
 	rukpakclientset := fake.NewSimpleClientset(initial)
-	machine := BundleMachine.WithContext(NewContext(map[string]interface{}{CtxBundleClient: rukpakclientset}))
+	machine := BundleMachine.WithContext(BundleMachineContext{client: rukpakclientset})
 	machine.Send(BundleSyncEvent(initial))
 	out, err := rukpakclientset.RukpakV1alpha1().Bundles("test").Get(context.TODO(), "test", metav1.GetOptions{})
 	require.NoError(t, err)
